@@ -14,7 +14,6 @@ import (
 	"github.com/olivere/elastic/v7"
 	"github.com/olivere/elastic/v7/uritemplates"
 	enumspb "go.temporal.io/api/enums/v1"
-	"go.temporal.io/server/common/auth"
 	"go.temporal.io/server/common/log"
 )
 
@@ -29,15 +28,7 @@ type (
 	}
 )
 
-const (
-	pointInTimeSupportedFlavor = "default" // the other flavor is "oss"
-)
-
-var (
-	pointInTimeSupportedIn = semver.MustParseRange(">=7.10.0")
-)
-
-var _ Client = (*clientImpl)(nil)
+// var _ Client = (*clientImpl)(nil)
 
 // newClient create a ES client
 func newClient(cfg *Config, httpClient *http.Client, logger log.Logger) (*clientImpl, error) {
@@ -113,19 +104,6 @@ func newClient(cfg *Config, httpClient *http.Client, logger log.Logger) (*client
 		esClient: client,
 		url:      cfg.URL,
 	}, nil
-}
-
-// Build Http Client with TLS
-func buildTLSHTTPClient(config *auth.TLS) (*http.Client, error) {
-	tlsConfig, err := auth.NewTLSConfig(config)
-	if err != nil {
-		return nil, err
-	}
-
-	transport := &http.Transport{TLSClientConfig: tlsConfig}
-	tlsClient := &http.Client{Transport: transport}
-
-	return tlsClient, nil
 }
 
 func (c *clientImpl) Get(ctx context.Context, index string, docID string) (*elastic.GetResult, error) {

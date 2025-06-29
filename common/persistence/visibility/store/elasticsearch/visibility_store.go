@@ -35,8 +35,8 @@ const (
 	PersistenceName = "elasticsearch"
 
 	delimiter                    = "~"
-	scrollKeepAliveInterval      = "1m"
-	pointInTimeKeepAliveInterval = "1m"
+	scrollKeepAliveInterval      = 1 * time.Minute
+	pointInTimeKeepAliveInterval = 1 * time.Minute
 )
 
 type (
@@ -257,10 +257,10 @@ func (s *VisibilityStore) DeleteWorkflowExecution(
 ) error {
 	docID := GetDocID(request.WorkflowID, request.RunID)
 
-	bulkDeleteRequest := &client.BulkableRequest{
+	bulkDeleteRequest := &client.BulkIndexerRequest{
 		Index:       s.index,
 		ID:          docID,
-		Version:     request.TaskID,
+		Version:     &request.TaskID,
 		RequestType: client.BulkableRequestTypeDelete,
 	}
 
@@ -292,12 +292,18 @@ func (s *VisibilityStore) addBulkIndexRequestAndWait(
 	esDoc map[string]interface{},
 	visibilityTaskKey string,
 ) error {
-	bulkIndexRequest := &client.BulkableRequest{
+	docBytes, err := json.Marshal(esDoc)
+	if err != nil {
+		return fmt.Errorf("failed to marshal document: %w", err)
+	}
+	docReader := bytes.NewReader(docBytes)
+
+	bulkIndexRequest := &client.BulkIndexerRequest{
 		Index:       s.index,
 		ID:          GetDocID(request.WorkflowID, request.RunID),
-		Version:     request.TaskID,
+		Version:     &request.TaskID,
 		RequestType: client.BulkableRequestTypeIndex,
-		Doc:         esDoc,
+		Doc:         docReader,
 	}
 
 	return s.AddBulkRequestAndWait(ctx, bulkIndexRequest, visibilityTaskKey)
@@ -305,7 +311,7 @@ func (s *VisibilityStore) addBulkIndexRequestAndWait(
 
 func (s *VisibilityStore) AddBulkRequestAndWait(
 	_ context.Context,
-	bulkRequest *client.BulkableRequest,
+	bulkRequest *client.BulkIndexerRequest,
 	visibilityTaskKey string,
 ) error {
 	s.checkProcessor()
@@ -384,7 +390,7 @@ func (s *VisibilityStore) scanWorkflowExecutionsWithScroll(
 	request *manager.ListWorkflowExecutionsRequestV2,
 ) (*store.InternalListWorkflowExecutionsResponse, error) {
 	var (
-		searchResult *elastic.SearchResult
+		searchResult *client.SearchResult
 		scrollErr    error
 	)
 
@@ -605,7 +611,7 @@ func (s *VisibilityStore) buildSearchParameters(
 func (s *VisibilityStore) BuildSearchParametersV2(
 	request *manager.ListWorkflowExecutionsRequestV2,
 	getFieldSorter func([]elastic.Sorter) ([]elastic.Sorter, error),
-) (*client.SearchParameters, error) {
+) (*client.SearchParametersNew, error) {
 	queryParams, err := s.convertQuery(
 		request.Namespace,
 		request.NamespaceID,
@@ -615,7 +621,7 @@ func (s *VisibilityStore) BuildSearchParametersV2(
 		return nil, err
 	}
 
-	searchParams := &client.SearchParameters{
+	searchParams := &client.SearchParametersNew{
 		Index:    s.index,
 		PageSize: request.PageSize,
 		Query:    queryParams.Query,
@@ -785,7 +791,7 @@ func (s *VisibilityStore) GetListFieldSorter(fieldSorts []elastic.Sorter) ([]ela
 }
 
 func (s *VisibilityStore) GetListWorkflowExecutionsResponse(
-	searchResult *elastic.SearchResult,
+	searchResult *client.SearchResult,
 	namespace namespace.Name,
 	pageSize int,
 ) (*store.InternalListWorkflowExecutionsResponse, error) {
