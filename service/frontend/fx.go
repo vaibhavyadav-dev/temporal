@@ -633,6 +633,7 @@ func AdminHandlerProvider(
 	timeSource clock.TimeSource,
 	taskCategoryRegistry tasks.TaskCategoryRegistry,
 	matchingClient resource.MatchingClient,
+	dc *dynamicconfig.Collection,
 ) *AdminHandler {
 	args := NewAdminHandlerArgs{
 		persistenceConfig,
@@ -661,6 +662,7 @@ func AdminHandlerProvider(
 		healthServer,
 		eventSerializer,
 		timeSource,
+		dc,
 		taskCategoryRegistry,
 		matchingClient,
 	}
