@@ -997,6 +997,7 @@ type SyncActivityTaskAttributes struct {
 	RetryMaximumInterval    *durationpb.Duration `protobuf:"bytes,23,opt,name=retry_maximum_interval,json=retryMaximumInterval,proto3" json:"retry_maximum_interval,omitempty"`
 	RetryMaximumAttempts    int32                `protobuf:"varint,24,opt,name=retry_maximum_attempts,json=retryMaximumAttempts,proto3" json:"retry_maximum_attempts,omitempty"`
 	RetryBackoffCoefficient float64              `protobuf:"fixed64,25,opt,name=retry_backoff_coefficient,json=retryBackoffCoefficient,proto3" json:"retry_backoff_coefficient,omitempty"`
+	StartVersion            int64                `protobuf:"varint,26,opt,name=start_version,json=startVersion,proto3" json:"start_version,omitempty"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -1206,6 +1207,13 @@ func (x *SyncActivityTaskAttributes) GetRetryBackoffCoefficient() float64 {
 	return 0
 }
 
+func (x *SyncActivityTaskAttributes) GetStartVersion() int64 {
+	if x != nil {
+		return x.StartVersion
+	}
+	return 0
+}
+
 type HistoryTaskAttributes struct {
 	state               protoimpl.MessageState    `protogen:"open.v1"`
 	NamespaceId         string                    `protobuf:"bytes,2,opt,name=namespace_id,json=namespaceId,proto3" json:"namespace_id,omitempty"`
@@ -1317,10 +1325,12 @@ func (x *HistoryTaskAttributes) GetEventsBatches() []*v11.DataBlob {
 }
 
 type SyncWorkflowStateTaskAttributes struct {
-	state         protoimpl.MessageState    `protogen:"open.v1"`
-	WorkflowState *v12.WorkflowMutableState `protobuf:"bytes,1,opt,name=workflow_state,json=workflowState,proto3" json:"workflow_state,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                    protoimpl.MessageState    `protogen:"open.v1"`
+	WorkflowState            *v12.WorkflowMutableState `protobuf:"bytes,1,opt,name=workflow_state,json=workflowState,proto3" json:"workflow_state,omitempty"`
+	IsForceReplication       bool                      `protobuf:"varint,2,opt,name=is_force_replication,json=isForceReplication,proto3" json:"is_force_replication,omitempty"`
+	IsCloseTransferTaskAcked bool                      `protobuf:"varint,3,opt,name=is_close_transfer_task_acked,json=isCloseTransferTaskAcked,proto3" json:"is_close_transfer_task_acked,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *SyncWorkflowStateTaskAttributes) Reset() {
@@ -1358,6 +1368,20 @@ func (x *SyncWorkflowStateTaskAttributes) GetWorkflowState() *v12.WorkflowMutabl
 		return x.WorkflowState
 	}
 	return nil
+}
+
+func (x *SyncWorkflowStateTaskAttributes) GetIsForceReplication() bool {
+	if x != nil {
+		return x.IsForceReplication
+	}
+	return false
+}
+
+func (x *SyncWorkflowStateTaskAttributes) GetIsCloseTransferTaskAcked() bool {
+	if x != nil {
+		return x.IsCloseTransferTaskAcked
+	}
+	return false
 }
 
 type TaskQueueUserDataAttributes struct {
@@ -1886,12 +1910,14 @@ type VersionedTransitionArtifact struct {
 	//
 	//	*VersionedTransitionArtifact_SyncWorkflowStateMutationAttributes
 	//	*VersionedTransitionArtifact_SyncWorkflowStateSnapshotAttributes
-	StateAttributes isVersionedTransitionArtifact_StateAttributes `protobuf_oneof:"state_attributes"`
-	EventBatches    []*v11.DataBlob                               `protobuf:"bytes,3,rep,name=event_batches,json=eventBatches,proto3" json:"event_batches,omitempty"`
-	NewRunInfo      *NewRunInfo                                   `protobuf:"bytes,4,opt,name=new_run_info,json=newRunInfo,proto3" json:"new_run_info,omitempty"`
-	IsFirstSync     bool                                          `protobuf:"varint,5,opt,name=is_first_sync,json=isFirstSync,proto3" json:"is_first_sync,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	StateAttributes          isVersionedTransitionArtifact_StateAttributes `protobuf_oneof:"state_attributes"`
+	EventBatches             []*v11.DataBlob                               `protobuf:"bytes,3,rep,name=event_batches,json=eventBatches,proto3" json:"event_batches,omitempty"`
+	NewRunInfo               *NewRunInfo                                   `protobuf:"bytes,4,opt,name=new_run_info,json=newRunInfo,proto3" json:"new_run_info,omitempty"`
+	IsFirstSync              bool                                          `protobuf:"varint,5,opt,name=is_first_sync,json=isFirstSync,proto3" json:"is_first_sync,omitempty"`
+	IsCloseTransferTaskAcked bool                                          `protobuf:"varint,6,opt,name=is_close_transfer_task_acked,json=isCloseTransferTaskAcked,proto3" json:"is_close_transfer_task_acked,omitempty"`
+	IsForceReplication       bool                                          `protobuf:"varint,7,opt,name=is_force_replication,json=isForceReplication,proto3" json:"is_force_replication,omitempty"`
+	unknownFields            protoimpl.UnknownFields
+	sizeCache                protoimpl.SizeCache
 }
 
 func (x *VersionedTransitionArtifact) Reset() {
@@ -1966,6 +1992,20 @@ func (x *VersionedTransitionArtifact) GetNewRunInfo() *NewRunInfo {
 func (x *VersionedTransitionArtifact) GetIsFirstSync() bool {
 	if x != nil {
 		return x.IsFirstSync
+	}
+	return false
+}
+
+func (x *VersionedTransitionArtifact) GetIsCloseTransferTaskAcked() bool {
+	if x != nil {
+		return x.IsCloseTransferTaskAcked
+	}
+	return false
+}
+
+func (x *VersionedTransitionArtifact) GetIsForceReplication() bool {
+	if x != nil {
+		return x.IsForceReplication
 	}
 	return false
 }
@@ -2067,7 +2107,7 @@ const file_temporal_server_api_replication_v1_message_proto_rawDesc = "" +
 	"\x0esource_cluster\x18\x01 \x01(\tR\rsourceCluster\x12\x19\n" +
 	"\bshard_id\x18\x02 \x01(\x05R\ashardId\x12;\n" +
 	"\vstatus_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"statusTime\"\xa0\v\n" +
+	"statusTime\"\xc5\v\n" +
 	"\x1aSyncActivityTaskAttributes\x12!\n" +
 	"\fnamespace_id\x18\x01 \x01(\tR\vnamespaceId\x12\x1f\n" +
 	"\vworkflow_id\x18\x02 \x01(\tR\n" +
@@ -2095,7 +2135,8 @@ const file_temporal_server_api_replication_v1_message_proto_rawDesc = "" +
 	"\x16retry_initial_interval\x18\x16 \x01(\v2\x19.google.protobuf.DurationR\x14retryInitialInterval\x12O\n" +
 	"\x16retry_maximum_interval\x18\x17 \x01(\v2\x19.google.protobuf.DurationR\x14retryMaximumInterval\x124\n" +
 	"\x16retry_maximum_attempts\x18\x18 \x01(\x05R\x14retryMaximumAttempts\x12:\n" +
-	"\x19retry_backoff_coefficient\x18\x19 \x01(\x01R\x17retryBackoffCoefficient\"\xad\x04\n" +
+	"\x19retry_backoff_coefficient\x18\x19 \x01(\x01R\x17retryBackoffCoefficient\x12#\n" +
+	"\rstart_version\x18\x1a \x01(\x03R\fstartVersion\"\xad\x04\n" +
 	"\x15HistoryTaskAttributes\x12!\n" +
 	"\fnamespace_id\x18\x02 \x01(\tR\vnamespaceId\x12\x1f\n" +
 	"\vworkflow_id\x18\x03 \x01(\tR\n" +
@@ -2108,9 +2149,11 @@ const file_temporal_server_api_replication_v1_message_proto_rawDesc = "" +
 	"\n" +
 	"new_run_id\x18\t \x01(\tR\bnewRunId\x12G\n" +
 	"\x0eevents_batches\x18\n" +
-	" \x03(\v2 .temporal.api.common.v1.DataBlobR\reventsBatchesJ\x04\b\x01\x10\x02\"\x82\x01\n" +
+	" \x03(\v2 .temporal.api.common.v1.DataBlobR\reventsBatchesJ\x04\b\x01\x10\x02\"\xf4\x01\n" +
 	"\x1fSyncWorkflowStateTaskAttributes\x12_\n" +
-	"\x0eworkflow_state\x18\x01 \x01(\v28.temporal.server.api.persistence.v1.WorkflowMutableStateR\rworkflowState\"\xbc\x01\n" +
+	"\x0eworkflow_state\x18\x01 \x01(\v28.temporal.server.api.persistence.v1.WorkflowMutableStateR\rworkflowState\x120\n" +
+	"\x14is_force_replication\x18\x02 \x01(\bR\x12isForceReplication\x12>\n" +
+	"\x1cis_close_transfer_task_acked\x18\x03 \x01(\bR\x18isCloseTransferTaskAcked\"\xbc\x01\n" +
 	"\x1bTaskQueueUserDataAttributes\x12!\n" +
 	"\fnamespace_id\x18\x01 \x01(\tR\vnamespaceId\x12&\n" +
 	"\x0ftask_queue_name\x18\x02 \x01(\tR\rtaskQueueName\x12R\n" +
@@ -2155,14 +2198,16 @@ const file_temporal_server_api_replication_v1_message_proto_rawDesc = "" +
 	"\fnamespace_id\x18\x06 \x01(\tR\vnamespaceId\x12\x1f\n" +
 	"\vworkflow_id\x18\a \x01(\tR\n" +
 	"workflowId\x12\x15\n" +
-	"\x06run_id\x18\b \x01(\tR\x05runIdJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x04\x10\x05\"\xb2\x04\n" +
+	"\x06run_id\x18\b \x01(\tR\x05runIdJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x04\x10\x05\"\xa4\x05\n" +
 	"\x1bVersionedTransitionArtifact\x12\x9f\x01\n" +
 	"'sync_workflow_state_mutation_attributes\x18\x01 \x01(\v2G.temporal.server.api.replication.v1.SyncWorkflowStateMutationAttributesH\x00R#syncWorkflowStateMutationAttributes\x12\x9f\x01\n" +
 	"'sync_workflow_state_snapshot_attributes\x18\x02 \x01(\v2G.temporal.server.api.replication.v1.SyncWorkflowStateSnapshotAttributesH\x00R#syncWorkflowStateSnapshotAttributes\x12E\n" +
 	"\revent_batches\x18\x03 \x03(\v2 .temporal.api.common.v1.DataBlobR\feventBatches\x12P\n" +
 	"\fnew_run_info\x18\x04 \x01(\v2..temporal.server.api.replication.v1.NewRunInfoR\n" +
 	"newRunInfo\x12\"\n" +
-	"\ris_first_sync\x18\x05 \x01(\bR\visFirstSyncB\x12\n" +
+	"\ris_first_sync\x18\x05 \x01(\bR\visFirstSync\x12>\n" +
+	"\x1cis_close_transfer_task_acked\x18\x06 \x01(\bR\x18isCloseTransferTaskAcked\x120\n" +
+	"\x14is_force_replication\x18\a \x01(\bR\x12isForceReplicationB\x12\n" +
 	"\x10state_attributesB5Z3go.temporal.io/server/api/replication/v1;repicationb\x06proto3"
 
 var (

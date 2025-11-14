@@ -24,6 +24,7 @@ import (
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/priorities"
 	"go.temporal.io/server/common/resource"
+	"go.temporal.io/server/common/softassert"
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/consts"
 	"go.temporal.io/server/service/history/deletemanager"
@@ -298,7 +299,7 @@ func (t *timerQueueActiveTaskExecutor) processSingleActivityTimeoutTask(
 
 	workflow.RecordActivityCompletionMetrics(
 		t.shardContext,
-		namespace.Name(mutableState.GetNamespaceEntry().Name()),
+		mutableState.GetNamespaceEntry().Name(),
 		ai.TaskQueue,
 		workflow.ActivityCompletionMetrics{
 			Status:             workflow.ActivityStatusTimeout,
@@ -310,7 +311,7 @@ func (t *timerQueueActiveTaskExecutor) processSingleActivityTimeoutTask(
 		metrics.OperationTag(metrics.TimerActiveTaskActivityTimeoutScope),
 		metrics.WorkflowTypeTag(mutableState.GetWorkflowType().GetName()),
 		metrics.ActivityTypeTag(ai.ActivityType.GetName()),
-	)
+		metrics.VersioningBehaviorTag(mutableState.GetEffectiveVersioningBehavior()))
 
 	if retryState == enumspb.RETRY_STATE_IN_PROGRESS {
 		// TODO uncommment once RETRY_STATE_PAUSED is supported
@@ -373,6 +374,10 @@ func (t *timerQueueActiveTaskExecutor) executeWorkflowTaskTimeoutTask(
 	workflowTask := mutableState.GetWorkflowTaskByID(task.EventID)
 	if workflowTask == nil {
 		return nil
+	}
+	if task.Stamp != workflowTask.Stamp {
+		release(nil) // release(nil) so that the mutable state is not unloaded from cache
+		return consts.ErrStaleReference
 	}
 
 	var operationMetricsTag string
@@ -532,7 +537,7 @@ func (t *timerQueueActiveTaskExecutor) executeActivityRetryTimerTask(
 	}
 
 	if task.Attempt < activityInfo.Attempt || activityInfo.StartedEventId != common.EmptyEventID {
-		t.logger.Info("Duplicate activity retry timer task",
+		softassert.Sometimes(t.logger).Info("Duplicate activity retry timer task",
 			tag.WorkflowID(mutableState.GetExecutionInfo().WorkflowId),
 			tag.WorkflowRunID(mutableState.GetExecutionState().GetRunId()),
 			tag.WorkflowNamespaceID(mutableState.GetExecutionInfo().NamespaceId),
@@ -905,6 +910,12 @@ func (t *timerQueueActiveTaskExecutor) emitTimeoutMetricScopeWithNamespaceTag(
 	case enumspb.TIMEOUT_TYPE_HEARTBEAT:
 		metrics.HeartbeatTimeoutCounter.With(metricsScope).Record(1)
 	}
+
+	softassert.Sometimes(t.logger).Debug("timer queue task timed out",
+		tag.NewStringTag("timer-type", timerType.String()),
+		tag.Operation(operation),
+		tag.Attempt(taskAttempt),
+	)
 }
 
 func (t *timerQueueActiveTaskExecutor) processActivityWorkflowRules(
@@ -925,6 +936,7 @@ func (t *timerQueueActiveTaskExecutor) processActivityWorkflowRules(
 		// need to update activity
 		if err := ms.UpdateActivity(ai.ScheduledEventId, func(activityInfo *persistencespb.ActivityInfo, _ historyi.MutableState) error {
 			activityInfo.StartedEventId = common.EmptyEventID
+			activityInfo.StartVersion = common.EmptyVersion
 			activityInfo.StartedTime = nil
 			activityInfo.RequestId = ""
 			return nil
@@ -1009,19 +1021,18 @@ func (t *timerQueueActiveTaskExecutor) executeChasmPureTimerTask(
 	// Execute all fired pure tasks for a component while holding the workflow lock.
 	processedTimers := 0
 	err = t.executeChasmPureTimers(
-		ctx,
-		wfCtx,
 		ms,
 		task,
-		func(executor chasm.NodePureTask, taskAttributes chasm.TaskAttributes, taskInstance any) error {
+		func(executor chasm.NodePureTask, taskAttributes chasm.TaskAttributes, taskInstance any) (bool, error) {
 			// ExecutePureTask also calls the task's validator. Invalid tasks will no-op
 			// succeed.
-			if err := executor.ExecutePureTask(ctx, taskAttributes, taskInstance); err != nil {
-				return err
+			executed, err := executor.ExecutePureTask(ctx, taskAttributes, taskInstance)
+			if err == nil {
+				processedTimers += 1
+
 			}
 
-			processedTimers += 1
-			return nil
+			return executed, err
 		},
 	)
 	if err != nil {

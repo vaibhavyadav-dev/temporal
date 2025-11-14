@@ -63,6 +63,86 @@ func (s *ChasmTestSuite) TestNewPayloadStore() {
 	s.NoError(err)
 }
 
+func (s *ChasmTestSuite) TestPayloadStore_UpdateComponent() {
+	tv := testvars.New(s.T())
+
+	ctx, cancel := context.WithTimeout(context.Background(), chasmTestTimeout)
+	defer cancel()
+
+	storeID := tv.Any().String()
+	_, err := tests.NewPayloadStoreHandler(
+		chasm.NewEngineContext(ctx, s.chasmEngine),
+		tests.NewPayloadStoreRequest{
+			NamespaceID: s.NamespaceID(),
+			StoreID:     storeID,
+		},
+	)
+	s.NoError(err)
+
+	_, err = tests.AddPayloadHandler(
+		chasm.NewEngineContext(ctx, s.chasmEngine),
+		tests.AddPayloadRequest{
+			NamespaceID: s.NamespaceID(),
+			StoreID:     storeID,
+			PayloadKey:  "key1",
+			Payload:     payload.EncodeString("value1"),
+		},
+	)
+	s.NoError(err)
+
+	descResp, err := tests.DescribePayloadStoreHandler(
+		chasm.NewEngineContext(ctx, s.chasmEngine),
+		tests.DescribePayloadStoreRequest{
+			NamespaceID: s.NamespaceID(),
+			StoreID:     storeID,
+		},
+	)
+	s.NoError(err)
+	s.Equal(int64(1), descResp.State.TotalCount)
+	s.Positive(descResp.State.TotalSize)
+}
+
+func (s *ChasmTestSuite) TestPayloadStore_PureTask() {
+	tv := testvars.New(s.T())
+
+	ctx, cancel := context.WithTimeout(context.Background(), chasmTestTimeout)
+	defer cancel()
+
+	storeID := tv.Any().String()
+	_, err := tests.NewPayloadStoreHandler(
+		chasm.NewEngineContext(ctx, s.chasmEngine),
+		tests.NewPayloadStoreRequest{
+			NamespaceID: s.NamespaceID(),
+			StoreID:     storeID,
+		},
+	)
+	s.NoError(err)
+
+	_, err = tests.AddPayloadHandler(
+		chasm.NewEngineContext(ctx, s.chasmEngine),
+		tests.AddPayloadRequest{
+			NamespaceID: s.NamespaceID(),
+			StoreID:     storeID,
+			PayloadKey:  "key1",
+			Payload:     payload.EncodeString("value1"),
+			TTL:         1 * time.Second,
+		},
+	)
+	s.NoError(err)
+
+	s.Eventually(func() bool {
+		descResp, err := tests.DescribePayloadStoreHandler(
+			chasm.NewEngineContext(ctx, s.chasmEngine),
+			tests.DescribePayloadStoreRequest{
+				NamespaceID: s.NamespaceID(),
+				StoreID:     storeID,
+			},
+		)
+		s.NoError(err)
+		return descResp.State.TotalCount == 0
+	}, 10*time.Second, 100*time.Millisecond)
+}
+
 func (s *ChasmTestSuite) TestPayloadStoreVisibility() {
 	tv := testvars.New(s.T())
 
@@ -119,9 +199,52 @@ func (s *ChasmTestSuite) TestPayloadStoreVisibility() {
 	s.True(ok)
 	s.NoError(payload.Decode(p, &intVal))
 	s.Equal(0, intVal)
-	var strVal string
-	s.NoError(payload.Decode(visRecord.SearchAttributes.IndexedFields[tests.TestKeywordSAFieldName], &strVal))
-	s.Equal(tests.TestKeywordSAFieldValue, strVal)
+	var totalCount int
+	s.NoError(payload.Decode(visRecord.SearchAttributes.IndexedFields["TemporalInt01"], &totalCount))
+	s.Equal(0, totalCount)
+	var totalSize int
+	s.NoError(payload.Decode(visRecord.SearchAttributes.IndexedFields["TemporalInt02"], &totalSize))
+	var scheduledByID string
+	s.NoError(payload.Decode(visRecord.SearchAttributes.IndexedFields["TemporalScheduledById"], &scheduledByID))
+	s.Equal(tests.TestScheduleID, scheduledByID)
+	s.Equal(0, totalSize)
+
+	addPayloadResp, err := tests.AddPayloadHandler(
+		engineContext,
+		tests.AddPayloadRequest{
+			NamespaceID: s.NamespaceID(),
+			StoreID:     storeID,
+			PayloadKey:  "key1",
+			Payload:     payload.EncodeString("value1"),
+		},
+	)
+	s.NoError(err)
+
+	s.Eventually(
+		func() bool {
+			resp, err := s.FrontendClient().ListWorkflowExecutions(ctx, &workflowservice.ListWorkflowExecutionsRequest{
+				Namespace: s.Namespace().String(),
+				PageSize:  10,
+				Query:     visQuery,
+			})
+			s.NoError(err)
+			if len(resp.Executions) != 1 {
+				return false
+			}
+
+			visRecord = resp.Executions[0]
+			var intVal int
+			s.NoError(payload.Decode(visRecord.GetMemo().GetFields()[tests.TotalCountMemoFieldName], &intVal))
+			return intVal == int(addPayloadResp.State.TotalCount)
+		},
+		testcore.WaitForESToSettle,
+		100*time.Millisecond,
+	)
+	// We validated Count memo field above, just checking for size here.
+	p, ok = visRecord.Memo.Fields[tests.TotalSizeMemoFieldName]
+	s.True(ok)
+	s.NoError(payload.Decode(p, &intVal))
+	s.Equal(addPayloadResp.State.TotalSize, int64(intVal))
 
 	_, err = tests.ClosePayloadStoreHandler(
 		engineContext,
@@ -151,7 +274,7 @@ func (s *ChasmTestSuite) TestPayloadStoreVisibility() {
 		100*time.Millisecond,
 	)
 	s.Equal(enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED, visRecord.Status)
-	s.Equal(int64(2), visRecord.StateTransitionCount)
+	s.Equal(int64(3), visRecord.StateTransitionCount)
 	s.NotEmpty(visRecord.CloseTime)
 	s.NotEmpty(visRecord.ExecutionDuration)
 	s.Empty(visRecord.HistoryLength)

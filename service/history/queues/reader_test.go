@@ -10,14 +10,17 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/server/common/clock"
+	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/collection"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/predicates"
 	"go.temporal.io/server/common/telemetry"
 	"go.temporal.io/server/service/history/tasks"
+	"go.temporal.io/server/service/history/tests"
 	"go.uber.org/mock/gomock"
 )
 
@@ -26,9 +29,11 @@ type (
 		suite.Suite
 		*require.Assertions
 
-		controller      *gomock.Controller
-		mockScheduler   *MockScheduler
-		mockRescheduler *MockRescheduler
+		controller            *gomock.Controller
+		mockScheduler         *MockScheduler
+		mockRescheduler       *MockRescheduler
+		mockClusterMetadata   *cluster.MockMetadata
+		mockNamespaceRegistry *namespace.MockRegistry
 
 		logger            log.Logger
 		metricsHandler    metrics.Handler
@@ -48,6 +53,10 @@ func (s *readerSuite) SetupTest() {
 	s.controller = gomock.NewController(s.T())
 	s.mockScheduler = NewMockScheduler(s.controller)
 	s.mockRescheduler = NewMockRescheduler(s.controller)
+	s.mockClusterMetadata = cluster.NewMockMetadata(s.controller)
+	s.mockClusterMetadata.EXPECT().GetCurrentClusterName().Return(cluster.TestCurrentClusterName).AnyTimes()
+	s.mockNamespaceRegistry = namespace.NewMockRegistry(s.controller)
+	s.mockNamespaceRegistry.EXPECT().GetNamespaceByID(gomock.Any()).Return(tests.LocalNamespaceEntry, nil).AnyTimes()
 
 	s.logger = log.NewTestLogger()
 	s.metricsHandler = metrics.NoopMetricsHandler
@@ -61,8 +70,9 @@ func (s *readerSuite) SetupTest() {
 			nil,
 			NewNoopPriorityAssigner(),
 			clock.NewRealTimeSource(),
-			nil,
-			nil,
+			s.mockNamespaceRegistry,
+			s.mockClusterMetadata,
+			testTaskTagValueProvider,
 			nil,
 			metrics.NoopMetricsHandler,
 			telemetry.NoopTracer,
@@ -89,6 +99,7 @@ func (s *readerSuite) TestStartLoadStop() {
 			mockTask := tasks.NewMockTask(s.controller)
 			mockTask.EXPECT().GetKey().Return(NewRandomKeyInRange(r)).AnyTimes()
 			mockTask.EXPECT().GetNamespaceID().Return(uuid.New()).AnyTimes()
+			mockTask.EXPECT().GetVisibilityTime().Return(time.Now()).AnyTimes()
 			return []tasks.Task{mockTask}, nil, nil
 		}
 	}
@@ -154,7 +165,10 @@ func (s *readerSuite) TestSplitSlices() {
 
 	splitter = func(s Slice) ([]Slice, bool) {
 		left, right := s.SplitByRange(NewRandomKeyInRange(s.Scope().Range))
-		return []Slice{left, right}, true
+
+		// empty slices should be ignored
+		left, empty := left.SplitByRange(left.Scope().Range.ExclusiveMax)
+		return []Slice{left, empty, right}, true
 	}
 	reader.SplitSlices(splitter)
 	s.Len(reader.Scopes(), 6)
@@ -165,7 +179,11 @@ func (s *readerSuite) TestMergeSlices() {
 	scopes := NewRandomScopes(rand.Intn(10))
 	reader := s.newTestReader(scopes, nil, NoopReaderCompletionFn)
 
-	incomingScopes := NewRandomScopes(rand.Intn(10))
+	incomingScopes := NewRandomScopes(10)
+	// manually set some scopes to be empty and verify they are ignored during merge
+	incomingScopes[2].Predicate = predicates.Empty[tasks.Task]()
+	incomingScopes[7].Predicate = predicates.Empty[tasks.Task]()
+
 	incomingSlices := make([]Slice, 0, len(incomingScopes))
 	for _, incomingScope := range incomingScopes {
 		incomingSlices = append(incomingSlices, NewSlice(nil, s.executableFactory, s.monitor, incomingScope, GrouperNamespaceID{}, noPredicateSizeLimit))
@@ -175,6 +193,7 @@ func (s *readerSuite) TestMergeSlices() {
 
 	mergedScopes := reader.Scopes()
 	for idx, scope := range mergedScopes[:len(mergedScopes)-1] {
+		s.False(scope.IsEmpty())
 		nextScope := mergedScopes[idx+1]
 		if scope.Range.ExclusiveMax.CompareTo(nextScope.Range.InclusiveMin) > 0 {
 			panic(fmt.Sprintf(
@@ -193,6 +212,7 @@ func (s *readerSuite) TestAppendSlices() {
 	reader := s.newTestReader(currentScopes, nil, NoopReaderCompletionFn)
 
 	incomingScopes := scopes[totalScopes/2:]
+	incomingScopes[2].Predicate = predicates.Empty[tasks.Task]()
 	incomingSlices := make([]Slice, 0, len(incomingScopes))
 	for _, incomingScope := range incomingScopes {
 		incomingSlices = append(incomingSlices, NewSlice(nil, s.executableFactory, s.monitor, incomingScope, GrouperNamespaceID{}, noPredicateSizeLimit))
@@ -200,10 +220,11 @@ func (s *readerSuite) TestAppendSlices() {
 
 	reader.AppendSlices(incomingSlices...)
 
-	appendedScopes := reader.Scopes()
-	s.Len(appendedScopes, totalScopes)
-	for idx, scope := range appendedScopes[:len(appendedScopes)-1] {
-		nextScope := appendedScopes[idx+1]
+	scopesAfterAppend := reader.Scopes()
+	s.Len(scopesAfterAppend, totalScopes-1) // one empty scope should be ignored
+	for idx, scope := range scopesAfterAppend[:len(scopesAfterAppend)-1] {
+		s.False(scope.IsEmpty())
+		nextScope := scopesAfterAppend[idx+1]
 		if scope.Range.ExclusiveMax.CompareTo(nextScope.Range.InclusiveMin) > 0 {
 			panic(fmt.Sprintf(
 				"Found overlapping scope in appended slices, left: %v, right: %v",
@@ -269,6 +290,7 @@ func (s *readerSuite) TestPause() {
 			mockTask := tasks.NewMockTask(s.controller)
 			mockTask.EXPECT().GetKey().Return(NewRandomKeyInRange(scopes[0].Range)).AnyTimes()
 			mockTask.EXPECT().GetNamespaceID().Return(uuid.New()).AnyTimes()
+			mockTask.EXPECT().GetVisibilityTime().Return(time.Now()).AnyTimes()
 			return []tasks.Task{mockTask}, nil, nil
 		}
 	}
@@ -338,6 +360,7 @@ func (s *readerSuite) TestLoadAndSubmitTasks_MoreTasks() {
 				mockTask := tasks.NewMockTask(s.controller)
 				mockTask.EXPECT().GetKey().Return(NewRandomKeyInRange(scopes[0].Range)).AnyTimes()
 				mockTask.EXPECT().GetNamespaceID().Return(uuid.New()).AnyTimes()
+				mockTask.EXPECT().GetVisibilityTime().Return(time.Now()).AnyTimes()
 				result = append(result, mockTask)
 			}
 
@@ -373,6 +396,7 @@ func (s *readerSuite) TestLoadAndSubmitTasks_NoMoreTasks_HasNextSlice() {
 			mockTask := tasks.NewMockTask(s.controller)
 			mockTask.EXPECT().GetKey().Return(NewRandomKeyInRange(scopes[0].Range)).AnyTimes()
 			mockTask.EXPECT().GetNamespaceID().Return(uuid.New()).AnyTimes()
+			mockTask.EXPECT().GetVisibilityTime().Return(time.Now()).AnyTimes()
 			return []tasks.Task{mockTask}, nil, nil
 		}
 	}
@@ -405,6 +429,7 @@ func (s *readerSuite) TestLoadAndSubmitTasks_NoMoreTasks_NoNextSlice() {
 			mockTask := tasks.NewMockTask(s.controller)
 			mockTask.EXPECT().GetKey().Return(NewRandomKeyInRange(scopes[0].Range)).AnyTimes()
 			mockTask.EXPECT().GetNamespaceID().Return(uuid.New()).AnyTimes()
+			mockTask.EXPECT().GetVisibilityTime().Return(time.Now()).AnyTimes()
 			return []tasks.Task{mockTask}, nil, nil
 		}
 	}
@@ -501,4 +526,8 @@ func (s *readerSuite) newTestReader(
 		s.logger,
 		s.metricsHandler,
 	)
+}
+
+func testTaskTagValueProvider(_ tasks.Task, _ bool) string {
+	return "testTaskType"
 }

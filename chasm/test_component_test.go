@@ -30,6 +30,8 @@ type (
 		SubComponent11Pointer2       Field[*TestSubComponent11]
 		SubComponentInterfacePointer Field[Component]
 
+		MSPointer MSPointer
+
 		Visibility Field[*Visibility]
 	}
 
@@ -60,6 +62,20 @@ type (
 	}
 )
 
+const (
+	TestComponentStartTimeSAKey   = "StartTimeSAKey"
+	TestComponentRunIDSAKey       = "RunIdSAKey"
+	TestComponentStartTimeMemoKey = "StartTimeMemoKey"
+)
+
+var (
+	TestComponentStartTimeSearchAttribute = NewSearchAttributeDateTime(TestComponentStartTimeSAKey, SearchAttributeFieldDateTime01)
+	TestComponentRunIDPredefinedSA        = newSearchAttributeKeywordByField(TestComponentRunIDSAKey)
+
+	_ VisibilitySearchAttributesProvider = (*TestComponent)(nil)
+	_ VisibilityMemoProvider             = (*TestComponent)(nil)
+)
+
 func (tc *TestComponent) LifecycleState(_ Context) LifecycleState {
 	switch tc.ComponentData.GetStatus() {
 	case enumspb.WORKFLOW_EXECUTION_STATUS_UNSPECIFIED, enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING:
@@ -87,6 +103,22 @@ func (tc *TestComponent) Fail(_ MutableContext) {
 	tc.ComponentData.Status = enumspb.WORKFLOW_EXECUTION_STATUS_FAILED
 }
 
+// SearchAttributes implements VisibilitySearchAttributesProvider interface.
+func (tc *TestComponent) SearchAttributes(_ Context) []SearchAttributeKeyValue {
+	return []SearchAttributeKeyValue{
+		TestComponentStartTimeSearchAttribute.Value(tc.ComponentData.GetStartTime().AsTime()),
+		TestComponentRunIDPredefinedSA.Value(tc.ComponentData.GetRunId()),
+		SearchAttributeTemporalScheduledByID.Value(tc.ComponentData.GetRunId()),
+	}
+}
+
+// Memo implements VisibilityMemoProvider interface.
+func (tc *TestComponent) Memo(_ Context) map[string]VisibilityValue {
+	return map[string]VisibilityValue{
+		TestComponentStartTimeMemoKey: VisibilityValueTime(tc.ComponentData.GetStartTime().AsTime()),
+	}
+}
+
 func (tsc1 *TestSubComponent1) LifecycleState(_ Context) LifecycleState {
 	return LifecycleStateRunning
 }
@@ -103,7 +135,7 @@ func (tsc2 *TestSubComponent2) LifecycleState(_ Context) LifecycleState {
 	return LifecycleStateRunning
 }
 
-func setTestComponentFields(c *TestComponent) {
+func setTestComponentFields(c *TestComponent, backend *MockNodeBackend) {
 	c.ComponentData = &protoMessageType{
 		CreateRequestId: "component-data",
 	}
@@ -124,6 +156,7 @@ func setTestComponentFields(c *TestComponent) {
 	c.SubData1 = NewDataField[*protoMessageType](nil, &protoMessageType{
 		CreateRequestId: "sub-data1",
 	})
+	c.MSPointer = NewMSPointer(backend)
 }
 
 // returns serialized version of TestComponent from above.

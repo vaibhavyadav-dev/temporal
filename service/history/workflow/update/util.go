@@ -7,6 +7,7 @@ import (
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/softassert"
 	"go.temporal.io/server/common/telemetry"
 	"google.golang.org/protobuf/proto"
 )
@@ -60,8 +61,13 @@ func (i *instrumentation) countTooMany() {
 	i.oneOf(metrics.WorkflowExecutionUpdateTooMany.Name())
 }
 
-func (i *instrumentation) countAborted() {
-	i.oneOf(metrics.WorkflowExecutionUpdateAborted.Name())
+func (i *instrumentation) countAborted(updateID string, reason AbortReason) {
+	i.metrics.Counter(metrics.WorkflowExecutionUpdateAborted.Name()).
+		Record(1, metrics.ReasonTag(metrics.ReasonString(reason.String())))
+	softassert.Sometimes(i.log).Debug("update aborted",
+		tag.NewStringTag("reason", reason.String()),
+		tag.NewStringTag("update-id", updateID),
+	)
 }
 
 func (i *instrumentation) countContinueAsNewSuggestions() {
@@ -78,10 +84,14 @@ func (i *instrumentation) countSentAgain() {
 
 func (i *instrumentation) invalidStateTransition(updateID string, msg proto.Message, state state) {
 	i.oneOf(metrics.InvalidStateTransitionWorkflowExecutionUpdateCounter.Name())
-	i.log.Error("invalid state transition attempted",
+	softassert.Fail(
+		i.log,
+		"invalid state transition attempted",
+		tag.ComponentWorkflowUpdate,
 		tag.NewStringTag("update-id", updateID),
 		tag.NewStringTag("message", fmt.Sprintf("%T", msg)),
-		tag.NewStringerTag("state", state))
+		tag.NewStringerTag("state", state),
+	)
 }
 
 func (i *instrumentation) updateRegistrySize(size int) {
@@ -93,7 +103,9 @@ func (i *instrumentation) oneOf(counterName string) {
 }
 
 func (i *instrumentation) stateChange(updateID string, from, to state) {
-	i.log.Debug("update state change",
+	softassert.Sometimes(i.log).Debug(
+		"update state change",
+		tag.ComponentWorkflowUpdate,
 		tag.NewStringTag("update-id", updateID),
 		tag.NewStringerTag("from-state", from),
 		tag.NewStringerTag("to-state", to),

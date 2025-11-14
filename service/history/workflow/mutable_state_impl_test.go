@@ -475,6 +475,156 @@ func (s *mutableStateSuite) TestRedirectInfoValidation_UnexpectedSticky() {
 	s.Equal(int64(0), s.mutableState.GetExecutionInfo().GetBuildIdRedirectCounter())
 }
 
+func (s *mutableStateSuite) TestPopulateDeleteTasks_WithWorkflowTaskTimeouts() {
+	// Test that workflow task timeout task references are added to BestEffortDeleteTasks when present.
+	version := int64(1)
+	workflowID := "wf-timeout-delete"
+	runID := uuid.New()
+	s.mutableState = TestGlobalMutableState(
+		s.mockShard,
+		s.mockEventsCache,
+		s.logger,
+		version,
+		workflowID,
+		runID,
+	)
+
+	// Create mock timeout tasks that meet the criteria
+	now := time.Now().UTC()
+	mockScheduleToStartTask := &tasks.WorkflowTaskTimeoutTask{
+		WorkflowKey: definition.NewWorkflowKey(
+			s.mutableState.GetExecutionInfo().NamespaceId,
+			workflowID,
+			runID,
+		),
+		VisibilityTimestamp: now.Add(10 * time.Second), // < 120s
+		TaskID:              123,
+		TimeoutType:         enumspb.TIMEOUT_TYPE_SCHEDULE_TO_START,
+		InMemory:            false, // Persisted task
+	}
+
+	mockStartToCloseTask := &tasks.WorkflowTaskTimeoutTask{
+		WorkflowKey: definition.NewWorkflowKey(
+			s.mutableState.GetExecutionInfo().NamespaceId,
+			workflowID,
+			runID,
+		),
+		VisibilityTimestamp: now.Add(30 * time.Second), // < 120s
+		TaskID:              456,
+		TimeoutType:         enumspb.TIMEOUT_TYPE_START_TO_CLOSE,
+		InMemory:            false, // Persisted task
+	}
+
+	// Schedule and start a workflow task
+	wft, err := s.mutableState.AddWorkflowTaskScheduledEvent(false, enumsspb.WORKFLOW_TASK_TYPE_NORMAL)
+	s.NoError(err)
+
+	sticky := &taskqueuepb.TaskQueue{Name: "sticky-tq", Kind: enumspb.TASK_QUEUE_KIND_STICKY}
+	_, wft, err = s.mutableState.AddWorkflowTaskStartedEvent(
+		wft.ScheduledEventID,
+		"",
+		sticky,
+		"",
+		nil,
+		nil,
+		nil,
+		false,
+	)
+	s.NoError(err)
+
+	// Set timeout tasks directly in mutable state (simulating what task_generator does)
+	s.mutableState.SetWorkflowTaskScheduleToStartTimeoutTask(mockScheduleToStartTask)
+	s.mutableState.SetWorkflowTaskStartToCloseTimeoutTask(mockStartToCloseTask)
+	// Call UpdateWorkflowTask to persist the workflow task info to ExecutionInfo
+	s.mutableState.workflowTaskManager.UpdateWorkflowTask(wft)
+
+	// Complete the workflow task
+	_, err = s.mutableState.AddWorkflowTaskCompletedEvent(
+		wft,
+		&workflowservice.RespondWorkflowTaskCompletedRequest{},
+		workflowTaskCompletionLimits,
+	)
+	s.NoError(err)
+
+	// Verify that BestEffortDeleteTasks contains the timeout task keys
+	del := s.mutableState.BestEffortDeleteTasks
+	s.Contains(del, tasks.CategoryTimer)
+	s.Equal(2, len(del[tasks.CategoryTimer]), "Should have both ScheduleToStart and StartToClose timeout tasks")
+	s.Contains(del[tasks.CategoryTimer], mockScheduleToStartTask.GetKey())
+	s.Contains(del[tasks.CategoryTimer], mockStartToCloseTask.GetKey())
+}
+
+func (s *mutableStateSuite) TestPopulateDeleteTasks_LongTimeout_NotIncluded() {
+	// Test that timeout tasks with very long timeouts (> 120s) are NOT added to BestEffortDeleteTasks.
+	version := int64(1)
+	workflowID := "wf-long-timeout"
+	runID := uuid.New()
+	s.mutableState = TestGlobalMutableState(
+		s.mockShard,
+		s.mockEventsCache,
+		s.logger,
+		version,
+		workflowID,
+		runID,
+	)
+
+	// Schedule a workflow task - this sets the scheduled time
+	wft, err := s.mutableState.AddWorkflowTaskScheduledEvent(false, enumsspb.WORKFLOW_TASK_TYPE_NORMAL)
+	s.NoError(err)
+
+	sticky := &taskqueuepb.TaskQueue{Name: "sticky-tq", Kind: enumspb.TASK_QUEUE_KIND_STICKY}
+	_, wft, err = s.mutableState.AddWorkflowTaskStartedEvent(
+		wft.ScheduledEventID,
+		"",
+		sticky,
+		"",
+		nil,
+		nil,
+		nil,
+		false,
+	)
+	s.NoError(err)
+
+	// Get the actual scheduled time from wft (this is what will be used in the calculation)
+	scheduledTime := wft.ScheduledTime
+	if scheduledTime.IsZero() {
+		// If scheduled time is not set in wft, use current time
+		scheduledTime = time.Now().UTC()
+	}
+
+	// Create a timeout task with timeout > 120s relative to the actual scheduled time
+	mockLongTimeoutTask := &tasks.WorkflowTaskTimeoutTask{
+		WorkflowKey: definition.NewWorkflowKey(
+			s.mutableState.GetExecutionInfo().NamespaceId,
+			workflowID,
+			runID,
+		),
+		VisibilityTimestamp: scheduledTime.Add(200 * time.Second), // > 120s from scheduled time
+		TaskID:              123,
+		TimeoutType:         enumspb.TIMEOUT_TYPE_SCHEDULE_TO_START,
+		InMemory:            false, // Persisted task
+	}
+
+	// Set the long timeout task directly in mutable state
+	s.mutableState.SetWorkflowTaskScheduleToStartTimeoutTask(mockLongTimeoutTask)
+	// Clear the StartToClose task so it doesn't interfere with the test
+	s.mutableState.SetWorkflowTaskStartToCloseTimeoutTask(nil)
+
+	// Complete the workflow task
+	_, err = s.mutableState.AddWorkflowTaskCompletedEvent(
+		wft,
+		&workflowservice.RespondWorkflowTaskCompletedRequest{},
+		workflowTaskCompletionLimits,
+	)
+	s.NoError(err)
+
+	// Verify that BestEffortDeleteTasks does NOT contain the long timeout task
+	del := s.mutableState.BestEffortDeleteTasks
+	if timerTasks, exists := del[tasks.CategoryTimer]; exists {
+		s.Equal(0, len(timerTasks), "Tasks with timeout > 120s should not be added to BestEffortDeleteTasks")
+	}
+}
+
 // creates a mutable state with first WFT completed on Build ID "b1"
 func (s *mutableStateSuite) createVersionedMutableStateWithCompletedWFT(tq *taskqueuepb.TaskQueue) {
 	version := int64(12)
@@ -762,12 +912,14 @@ func (s *mutableStateSuite) createMutableStateWithVersioningBehavior(
 		workflowID,
 		runID,
 	)
+	s.EqualValues(0, s.mutableState.executionInfo.WorkflowTaskStamp)
+	s.mutableState.executionInfo.Attempt = 5 // pretend we are in the middle workflow task retries
 
 	wft, err := s.mutableState.AddWorkflowTaskScheduledEvent(true, enumsspb.WORKFLOW_TASK_TYPE_NORMAL)
 	s.NoError(err)
 	s.verifyEffectiveDeployment(nil, enumspb.VERSIONING_BEHAVIOR_UNSPECIFIED)
 
-	err = s.mutableState.StartDeploymentTransition(deployment)
+	err = s.mutableState.StartDeploymentTransition(deployment, 0)
 	s.NoError(err)
 	s.verifyEffectiveDeployment(deployment, enumspb.VERSIONING_BEHAVIOR_AUTO_UPGRADE)
 
@@ -817,7 +969,7 @@ func (s *mutableStateSuite) TestUnpinnedTransition() {
 	s.NoError(err)
 	s.verifyEffectiveDeployment(deployment1, behavior)
 
-	err = s.mutableState.StartDeploymentTransition(deployment2)
+	err = s.mutableState.StartDeploymentTransition(deployment2, 0)
 	s.NoError(err)
 	s.verifyEffectiveDeployment(deployment2, behavior)
 
@@ -856,7 +1008,7 @@ func (s *mutableStateSuite) TestUnpinnedTransitionFailed() {
 	s.NoError(err)
 	s.verifyEffectiveDeployment(deployment1, behavior)
 
-	err = s.mutableState.StartDeploymentTransition(deployment2)
+	err = s.mutableState.StartDeploymentTransition(deployment2, 0)
 	s.NoError(err)
 	s.verifyEffectiveDeployment(deployment2, behavior)
 
@@ -898,7 +1050,7 @@ func (s *mutableStateSuite) TestUnpinnedTransitionTimeout() {
 	s.NoError(err)
 	s.verifyEffectiveDeployment(deployment1, behavior)
 
-	err = s.mutableState.StartDeploymentTransition(deployment2)
+	err = s.mutableState.StartDeploymentTransition(deployment2, 0)
 	s.NoError(err)
 	s.verifyEffectiveDeployment(deployment2, behavior)
 
@@ -1049,14 +1201,13 @@ func (s *mutableStateSuite) TestOverride_RedirectFails() {
 	s.verifyOverrides(baseBehavior, overrideBehavior, deployment1, deployment3)
 
 	// assert that transition fails
-	err = s.mutableState.StartDeploymentTransition(deployment2)
+	err = s.mutableState.StartDeploymentTransition(deployment2, 0)
 	s.ErrorIs(err, ErrPinnedWorkflowCannotTransition)
 	s.verifyEffectiveDeployment(deployment3, overrideBehavior)
 	s.verifyOverrides(baseBehavior, overrideBehavior, deployment1, deployment3)
 }
 
 func (s *mutableStateSuite) TestOverride_BaseDeploymentUpdatedOnCompletion() {
-	s.T().Skip("TODO (Shahab)")
 	tq := &taskqueuepb.TaskQueue{Name: "tq"}
 	baseBehavior := enumspb.VERSIONING_BEHAVIOR_AUTO_UPGRADE
 	overrideBehavior := enumspb.VERSIONING_BEHAVIOR_PINNED
@@ -1075,7 +1226,7 @@ func (s *mutableStateSuite) TestOverride_BaseDeploymentUpdatedOnCompletion() {
 	s.verifyOverrides(baseBehavior, overrideBehavior, deployment1, deployment3)
 
 	// assert that redirect fails - should be its own test
-	err = s.mutableState.StartDeploymentTransition(deployment2)
+	err = s.mutableState.StartDeploymentTransition(deployment2, 0)
 	s.ErrorIs(err, ErrPinnedWorkflowCannotTransition)
 	s.verifyEffectiveDeployment(deployment3, overrideBehavior)
 	s.verifyOverrides(baseBehavior, overrideBehavior, deployment1, deployment3) // base deployment still deployment1 here -- good
@@ -2231,6 +2382,7 @@ func (s *mutableStateSuite) TestRetryWorkflowTask_WithNextRetryDelay() {
 }
 func (s *mutableStateSuite) TestRetryActivity_TruncateRetryableFailure() {
 	s.mockEventsCache.EXPECT().PutEvent(gomock.Any(), gomock.Any()).AnyTimes()
+	s.mockConfig.EnableActivityRetryStampIncrement = dynamicconfig.GetBoolPropertyFn(true)
 
 	// scheduling, starting & completing workflow task is omitted here
 
@@ -2281,14 +2433,61 @@ func (s *mutableStateSuite) TestRetryActivity_TruncateRetryableFailure() {
 	}
 	s.Greater(activityFailure.Size(), failureSizeErrorLimit)
 
+	prevStamp := activityInfo.Stamp
+
 	retryState, err := s.mutableState.RetryActivity(activityInfo, activityFailure)
 	s.NoError(err)
 	s.Equal(enumspb.RETRY_STATE_IN_PROGRESS, retryState)
 
 	activityInfo, ok := s.mutableState.GetActivityInfo(activityInfo.ScheduledEventId)
 	s.True(ok)
+	s.Greater(activityInfo.Stamp, prevStamp)
+	s.Equal(int32(2), activityInfo.Attempt)
 	s.LessOrEqual(activityInfo.RetryLastFailure.Size(), failureSizeErrorLimit)
 	s.Equal(activityFailure.GetMessage(), activityInfo.RetryLastFailure.Cause.GetMessage())
+}
+
+func (s *mutableStateSuite) TestRetryActivity_PausedIncrementsStamp() {
+	s.mockEventsCache.EXPECT().PutEvent(gomock.Any(), gomock.Any()).AnyTimes()
+	s.mockConfig.EnableActivityRetryStampIncrement = dynamicconfig.GetBoolPropertyFn(true)
+
+	workflowTaskCompletedEventID := int64(4)
+	_, activityInfo, err := s.mutableState.AddActivityTaskScheduledEvent(
+		workflowTaskCompletedEventID,
+		&commandpb.ScheduleActivityTaskCommandAttributes{
+			ActivityId:   "6",
+			ActivityType: &commonpb.ActivityType{Name: "activity-type"},
+			TaskQueue:    &taskqueuepb.TaskQueue{Name: "task-queue"},
+			RetryPolicy: &commonpb.RetryPolicy{
+				InitialInterval: timestamp.DurationFromSeconds(1),
+			},
+		},
+		false,
+	)
+	s.NoError(err)
+
+	_, err = s.mutableState.AddActivityTaskStartedEvent(
+		activityInfo,
+		activityInfo.ScheduledEventId,
+		uuid.New(),
+		"worker-identity",
+		nil,
+		nil,
+		nil,
+	)
+	s.NoError(err)
+
+	activityInfo.Paused = true
+	prevStamp := activityInfo.Stamp
+
+	retryState, err := s.mutableState.RetryActivity(activityInfo, &failurepb.Failure{Message: "activity failure"})
+	s.NoError(err)
+	s.Equal(enumspb.RETRY_STATE_IN_PROGRESS, retryState)
+
+	updatedActivityInfo, ok := s.mutableState.GetActivityInfo(activityInfo.ScheduledEventId)
+	s.True(ok)
+	s.Greater(updatedActivityInfo.Stamp, prevStamp)
+	s.Equal(int32(2), updatedActivityInfo.Attempt)
 }
 
 func (s *mutableStateSuite) TestupdateBuildIdsAndDeploymentSearchAttributes() {
@@ -4377,6 +4576,7 @@ func (s *mutableStateSuite) verifyExecutionInfo(current, target, origin *persist
 	s.Equal(target.StickyTaskQueue, current.StickyTaskQueue, "StickyTaskQueue mismatch")
 	s.True(proto.Equal(target.StickyScheduleToStartTimeout, current.StickyScheduleToStartTimeout), "StickyScheduleToStartTimeout mismatch")
 	s.Equal(target.Attempt, current.Attempt, "Attempt mismatch")
+	s.Equal(target.WorkflowTaskStamp, current.WorkflowTaskStamp, "WorkflowTaskStamp mismatch")
 	s.True(proto.Equal(target.RetryInitialInterval, current.RetryInitialInterval), "RetryInitialInterval mismatch")
 	s.True(proto.Equal(target.RetryMaximumInterval, current.RetryMaximumInterval), "RetryMaximumInterval mismatch")
 	s.Equal(target.RetryMaximumAttempts, current.RetryMaximumAttempts, "RetryMaximumAttempts mismatch")
@@ -5123,8 +5323,6 @@ func (s *mutableStateSuite) TestHasRequestID() {
 }
 
 func (s *mutableStateSuite) TestHasRequestID_StateConsistency() {
-	s.SetupTest()
-
 	// Test that HasRequestID is consistent with AttachRequestID
 	requestID := "consistency-test-request-id"
 
@@ -5141,8 +5339,6 @@ func (s *mutableStateSuite) TestHasRequestID_StateConsistency() {
 }
 
 func (s *mutableStateSuite) TestHasRequestID_EmptyExecutionState() {
-	s.SetupTest()
-
 	// Ensure execution state has no request IDs initially
 	if s.mutableState.executionState.RequestIds == nil {
 		s.mutableState.executionState.RequestIds = make(map[string]*persistencespb.RequestIDInfo)
@@ -5162,5 +5358,84 @@ func (s *mutableStateSuite) TestHasRequestID_EmptyExecutionState() {
 
 	for _, requestID := range testRequestIDs {
 		s.False(s.mutableState.HasRequestID(requestID), "Should return false for request ID: %s", requestID)
+	}
+}
+
+func (s *mutableStateSuite) TestAddTasks_CHASMPureTask() {
+	s.mockConfig.ChasmMaxInMemoryPureTasks = dynamicconfig.GetIntPropertyFn(5)
+	totalTasks := 2 * s.mockConfig.ChasmMaxInMemoryPureTasks()
+
+	visTimestamp := s.mockShard.GetTimeSource().Now()
+	for i := 0; i < totalTasks; i++ {
+		task := &tasks.ChasmTaskPure{
+			VisibilityTimestamp: visTimestamp,
+			Category:            tasks.CategoryTimer,
+		}
+		s.mutableState.AddTasks(task)
+		s.LessOrEqual(len(s.mutableState.chasmPureTasks), s.mockConfig.ChasmMaxInMemoryPureTasks())
+
+		visTimestamp = visTimestamp.Add(-time.Minute)
+	}
+
+	s.mockConfig.ChasmMaxInMemoryPureTasks = dynamicconfig.GetIntPropertyFn(2)
+	s.mutableState.AddTasks(&tasks.ChasmTaskPure{
+		VisibilityTimestamp: visTimestamp,
+		Category:            tasks.CategoryTimer,
+	})
+	s.Len(s.mutableState.chasmPureTasks, 2)
+}
+
+func (s *mutableStateSuite) TestDeleteCHASMPureTasks() {
+	now := s.mockShard.GetTimeSource().Now()
+
+	testCases := []struct {
+		name              string
+		maxScheduledTime  time.Time
+		expectedRemaining int
+	}{
+		{
+			name:              "none",
+			maxScheduledTime:  now,
+			expectedRemaining: 3,
+		},
+		{
+			name:              "paritial",
+			maxScheduledTime:  now.Add(2 * time.Minute),
+			expectedRemaining: 2,
+		},
+		{
+			name:              "all",
+			maxScheduledTime:  now.Add(5 * time.Minute),
+			expectedRemaining: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.mutableState.chasmPureTasks = []*tasks.ChasmTaskPure{
+				{
+					VisibilityTimestamp: now.Add(3 * time.Minute),
+					Category:            tasks.CategoryTimer,
+				},
+				{
+					VisibilityTimestamp: now.Add(2 * time.Minute),
+					Category:            tasks.CategoryTimer,
+				},
+				{
+					VisibilityTimestamp: now.Add(time.Minute),
+					Category:            tasks.CategoryTimer,
+				},
+			}
+			s.mutableState.BestEffortDeleteTasks = make(map[tasks.Category][]tasks.Key)
+
+			s.mutableState.DeleteCHASMPureTasks(tc.maxScheduledTime)
+
+			s.Len(s.mutableState.chasmPureTasks, tc.expectedRemaining)
+			for _, task := range s.mutableState.chasmPureTasks {
+				s.False(task.VisibilityTimestamp.Before(tc.maxScheduledTime))
+			}
+
+			s.Len(s.mutableState.BestEffortDeleteTasks[tasks.CategoryTimer], 3-tc.expectedRemaining)
+		})
 	}
 }

@@ -74,11 +74,14 @@ func UpdateActivityInfoForRetries(
 	attempt int32,
 	failure *failurepb.Failure,
 	nextScheduledTime *timestamppb.Timestamp,
+	isActivityRetryStampIncrementEnabled bool,
 ) *persistencespb.ActivityInfo {
+	previousAttempt := ai.Attempt
 	ai.Attempt = attempt
 	ai.Version = version
 	ai.ScheduledTime = nextScheduledTime
 	ai.StartedEventId = common.EmptyEventID
+	ai.StartVersion = common.EmptyVersion
 	ai.RequestId = ""
 	ai.StartedTime = nil
 	ai.TimerTaskStatus = TimerTaskStatusNone
@@ -94,6 +97,10 @@ func UpdateActivityInfoForRetries(
 	}
 	ai.ActivityReset = false
 	ai.ResetHeartbeats = false
+
+	if isActivityRetryStampIncrementEnabled && attempt > previousAttempt {
+		ai.Stamp++
+	}
 
 	return ai
 }

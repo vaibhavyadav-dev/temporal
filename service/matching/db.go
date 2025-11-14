@@ -32,14 +32,19 @@ const (
 
 type (
 	taskQueueDB struct {
-		sync.Mutex
+		// constants
 		config         *taskQueueConfig
 		queue          *PhysicalTaskQueueKey
-		rangeID        int64
+		isDraining     bool
 		store          persistence.TaskManager
 		logger         log.Logger
 		metricsHandler metrics.Handler
-		subqueues      []*dbSubqueue
+
+		// mutable
+		sync.Mutex
+		rangeID       int64
+		subqueues     []*dbSubqueue
+		otherHasTasks bool
 
 		// used to avoid unnecessary metadata writes:
 		lastChange time.Time // updated when metadata is changed in memory
@@ -53,9 +58,10 @@ type (
 	}
 
 	taskQueueState struct {
-		rangeID   int64
-		ackLevel  int64 // TODO(pri): old matcher cleanup, delete later
-		subqueues []persistencespb.SubqueueInfo
+		rangeID       int64
+		ackLevel      int64 // TODO(pri): old matcher cleanup, delete later
+		subqueues     []persistencespb.SubqueueInfo
+		otherHasTasks bool
 	}
 
 	subqueueIndex int
@@ -89,10 +95,12 @@ func newTaskQueueDB(
 	queue *PhysicalTaskQueueKey,
 	logger log.Logger,
 	metricsHandler metrics.Handler,
+	isDraining bool,
 ) *taskQueueDB {
 	return &taskQueueDB{
 		config:         config,
 		queue:          queue,
+		isDraining:     isDraining,
 		store:          store,
 		logger:         logger,
 		metricsHandler: metricsHandler,
@@ -153,9 +161,10 @@ func (db *taskQueueDB) RenewLease(
 		}
 	}
 	return taskQueueState{
-		rangeID:   db.rangeID,
-		ackLevel:  db.subqueues[subqueueZero].AckLevel, // TODO(pri): cleanup, only used by old backlog manager
-		subqueues: db.cloneSubqueues(),
+		rangeID:       db.rangeID,
+		ackLevel:      db.subqueues[subqueueZero].AckLevel, // TODO(pri): cleanup, only used by old backlog manager
+		subqueues:     db.cloneSubqueues(),
+		otherHasTasks: !db.isDraining && db.otherHasTasks,
 	}, nil
 }
 
@@ -170,6 +179,9 @@ func (db *taskQueueDB) takeOverTaskQueueLocked(
 	switch err.(type) {
 	case nil:
 		db.rangeID = response.RangeID
+		// If we are the draining one, then assume the other has tasks, so we can migrate
+		// backwards safely.
+		db.otherHasTasks = response.TaskQueueInfo.OtherHasTasks || db.isDraining
 		db.subqueues = db.ensureDefaultSubqueuesLocked(
 			response.TaskQueueInfo.Subqueues,
 			response.TaskQueueInfo.AckLevel,
@@ -180,6 +192,7 @@ func (db *taskQueueDB) takeOverTaskQueueLocked(
 			db.rangeID = 0
 			return err
 		}
+		db.lastWrite = time.Now()
 		// We took over the task queue and are not sure what tasks may have been written
 		// before. Set max read level id of all subqueues to just before our new block.
 		maxReadLevel := rangeIDToTaskIDBlock(db.rangeID, db.config.RangeSize).start - 1
@@ -191,6 +204,13 @@ func (db *taskQueueDB) takeOverTaskQueueLocked(
 	case *serviceerror.NotFound:
 		db.rangeID = initialRangeID
 		db.subqueues = db.ensureDefaultSubqueuesLocked(nil, 0, 0)
+
+		// If we are the draining one, then assume the other has tasks, so we can migrate
+		// backwards safely. Also assume other has tasks if the config allows for migration
+		// (and we're not sticky) since we may have just turned on fairness and need to migrate.
+		canMigrate := (db.config.NewMatcher || db.config.EnableFairness) && db.queue.Partition().Kind() != enumspb.TASK_QUEUE_KIND_STICKY
+		db.otherHasTasks = canMigrate || db.isDraining
+
 		if _, err := db.store.CreateTaskQueue(ctx, &persistence.CreateTaskQueueRequest{
 			RangeID:       db.rangeID,
 			TaskQueueInfo: db.cachedQueueInfo(),
@@ -282,8 +302,10 @@ func (db *taskQueueDB) updateAckLevelAndBacklogStats(subqueue subqueueIndex, new
 	dbQueue := db.subqueues[subqueue]
 	if newAckLevel < dbQueue.AckLevel {
 		softassert.Fail(db.logger,
-			fmt.Sprintf("ack level in subqueue %d should not move backwards (from %v to %v)",
-				subqueue, dbQueue.AckLevel, newAckLevel))
+			"ack level in subqueue should not move backwards",
+			tag.NewInt("subqueue-id", int(subqueue)),
+			tag.NewAnyTag("cur-ack-level", dbQueue.AckLevel),
+			tag.NewAnyTag("new-ack-level", newAckLevel))
 	}
 	if dbQueue.AckLevel != newAckLevel {
 		db.lastChange = time.Now()
@@ -311,8 +333,10 @@ func (db *taskQueueDB) updateFairAckLevel(subqueue subqueueIndex, newAckLevel fa
 	dbQueue := db.subqueues[subqueue]
 	if prev := fairLevelFromProto(dbQueue.FairAckLevel); newAckLevel.less(prev) {
 		softassert.Fail(db.logger,
-			fmt.Sprintf("ack level in subqueue %d should not move backwards (from %v to %v)",
-				subqueue, prev, newAckLevel))
+			"ack level in subqueue should not move backwards",
+			tag.NewInt("subqueue-id", int(subqueue)),
+			tag.NewAnyTag("cur-ack-level", prev),
+			tag.NewAnyTag("new-ack-level", newAckLevel))
 	}
 	dbQueue.FairAckLevel = newAckLevel.toProto()
 
@@ -399,6 +423,10 @@ func (db *taskQueueDB) CreateTasks(
 	ctx context.Context,
 	reqs []*writeTaskRequest,
 ) (createTasksResponse, error) {
+	if db.isDraining {
+		return createTasksResponse{}, softassert.UnexpectedInternalErr(db.logger, "CreateTasks can't be used in draining mode", nil)
+	}
+
 	db.Lock()
 	defer db.Unlock()
 
@@ -448,9 +476,12 @@ func (db *taskQueueDB) CreateTasks(
 	}
 
 	if err == nil {
-		// Only update lastWrite for persistence implementations that update metadata on CreateTasks.
+		// Only update lastWrite for persistence implementations that update metadata on CreateTasks,
+		// otherwise we have a change to ApproximateBacklogCount we need to write.
 		if resp.UpdatedMetadata {
 			db.lastWrite = time.Now()
+		} else {
+			db.lastChange = time.Now()
 		}
 	} else if _, ok := err.(*persistence.ConditionFailedError); ok {
 		// tasks definitely were not created, restore the counter. For other errors tasks may or may not be created.
@@ -467,6 +498,10 @@ func (db *taskQueueDB) CreateFairTasks(
 	ctx context.Context,
 	reqs []*writeTaskRequest,
 ) (createFairTasksResponse, error) {
+	if db.isDraining {
+		return createFairTasksResponse{}, softassert.UnexpectedInternalErr(db.logger, "CreateTasks can't be used in draining mode", nil)
+	}
+
 	db.Lock()
 	defer db.Unlock()
 
@@ -514,9 +549,12 @@ func (db *taskQueueDB) CreateFairTasks(
 		})
 
 	if err == nil {
-		// Only update lastWrite for persistence implementations that update metadata on CreateTasks.
+		// Only update lastWrite for persistence implementations that update metadata on CreateTasks,
+		// otherwise we have a change to ApproximateBacklogCount we need to write.
 		if resp.UpdatedMetadata {
 			db.lastWrite = time.Now()
+		} else {
+			db.lastChange = time.Now()
 		}
 	} else if _, ok := err.(*persistence.ConditionFailedError); ok {
 		// Tasks definitely were not created, restore the counter. For other errors tasks may or may not be created.
@@ -677,6 +715,7 @@ func (db *taskQueueDB) cachedQueueInfo() *persistencespb.TaskQueueInfo {
 		LastUpdateTime:          timestamp.TimeNowPtrUtc(),
 		ApproximateBacklogCount: db.subqueues[subqueueZero].ApproximateBacklogCount, // backwards compatibility
 		Subqueues:               infos,
+		OtherHasTasks:           db.otherHasTasks,
 	}
 }
 
@@ -690,10 +729,11 @@ func (db *taskQueueDB) emitBacklogGaugesLocked() {
 		return
 	}
 
-	var approximateBacklogCount, totalLag int64
+	var totalLag int64
 	var oldestTime time.Time
+	counts := make(map[int32]int64)
 	for _, s := range db.subqueues {
-		approximateBacklogCount += s.ApproximateBacklogCount
+		counts[s.Key.Priority] += s.ApproximateBacklogCount
 		oldestTime = minNonZeroTime(oldestTime, s.oldestTime)
 		// note: this metric is only an estimation for the lag.
 		// taskID in DB may not be continuous, especially when task list ownership changes.
@@ -706,7 +746,9 @@ func (db *taskQueueDB) emitBacklogGaugesLocked() {
 		}
 	}
 
-	metrics.ApproximateBacklogCount.With(db.metricsHandler).Record(float64(approximateBacklogCount))
+	for priority, count := range counts {
+		metrics.ApproximateBacklogCount.With(db.metricsHandler).Record(float64(count), metrics.MatchingTaskPriorityTag(priority))
+	}
 	if oldestTime.IsZero() {
 		metrics.ApproximateBacklogAgeSeconds.With(db.metricsHandler).Record(0)
 	} else {
@@ -729,7 +771,7 @@ func (db *taskQueueDB) ensureDefaultSubqueuesLocked(
 
 	// check for default priority and add if not present (this may be initializing subqueue 0)
 	defKey := &persistencespb.SubqueueKey{
-		Priority: int32(defaultPriorityLevel(db.config.PriorityLevels())),
+		Priority: int32(db.config.DefaultPriorityKey),
 	}
 	hasDefault := slices.ContainsFunc(subqueues, func(s *dbSubqueue) bool {
 		return proto.Equal(s.Key, defKey)
@@ -765,4 +807,25 @@ func (db *taskQueueDB) cloneSubqueues() []persistencespb.SubqueueInfo {
 		proto.Merge(&infos[i], &db.subqueues[i].SubqueueInfo)
 	}
 	return infos
+}
+
+func (db *taskQueueDB) emitZeroBacklogGauges() {
+	if !db.config.BreakdownMetricsByTaskQueue() ||
+		!db.config.BreakdownMetricsByPartition() ||
+		(db.queue.IsVersioned() && !db.config.BreakdownMetricsByBuildID()) {
+		return
+	}
+
+	priorities := make(map[int32]struct{})
+	db.Lock()
+	for _, s := range db.subqueues {
+		priorities[s.Key.Priority] = struct{}{}
+	}
+	db.Unlock()
+
+	for k := range priorities {
+		metrics.ApproximateBacklogCount.With(db.metricsHandler).Record(0, metrics.MatchingTaskPriorityTag(k))
+	}
+	metrics.ApproximateBacklogAgeSeconds.With(db.metricsHandler).Record(0)
+	metrics.TaskLagPerTaskQueueGauge.With(db.metricsHandler).Record(0)
 }

@@ -26,6 +26,7 @@ import (
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/persistence/versionhistory"
 	serviceerrors "go.temporal.io/server/common/serviceerror"
+	"go.temporal.io/server/common/softassert"
 	ctasks "go.temporal.io/server/common/tasks"
 	"go.temporal.io/server/service/history/consts"
 	historyi "go.temporal.io/server/service/history/interfaces"
@@ -48,11 +49,6 @@ const (
 )
 
 var (
-	TaskRetryPolicy = backoff.NewExponentialRetryPolicy(1 * time.Second).
-			WithBackoffCoefficient(1.2).
-			WithMaximumInterval(5 * time.Second).
-			WithMaximumAttempts(80).
-			WithExpirationInterval(10 * time.Minute)
 	ErrResendAttemptExceeded = serviceerror.NewInternal("resend history attempts exceeded")
 )
 
@@ -261,7 +257,11 @@ func (e *ExecutableTaskImpl) IsRetryableError(err error) bool {
 }
 
 func (e *ExecutableTaskImpl) RetryPolicy() backoff.RetryPolicy {
-	return TaskRetryPolicy
+	return backoff.NewExponentialRetryPolicy(e.Config.ReplicationExecutableTaskErrorRetryWait()).
+		WithBackoffCoefficient(e.Config.ReplicationExecutableTaskErrorRetryBackoffCoefficient()).
+		WithMaximumInterval(e.Config.ReplicationExecutableTaskErrorRetryMaxInterval()).
+		WithMaximumAttempts(e.Config.ReplicationExecutableTaskErrorRetryMaxAttempts()).
+		WithExpirationInterval(e.Config.ReplicationExecutableTaskErrorRetryExpiration())
 }
 
 func (e *ExecutableTaskImpl) State() ctasks.State {
@@ -307,8 +307,13 @@ func (e *ExecutableTaskImpl) emitFinishMetrics(
 		metrics.OperationTag(e.metricsTag),
 		nsTag,
 	)
-	if processingLatency > 30*time.Second {
-		e.Logger.Warn("replication task processing latency is too long",
+	replicationLatency := now.Sub(e.taskCreationTime)
+	if replicationLatency > time.Minute {
+		e.Logger.Warn(fmt.Sprintf(
+			"replication task latency is too long: transmission=%.2fs processing=%.2fs",
+			e.taskReceivedTime.Sub(e.taskCreationTime).Seconds(),
+			processingLatency.Seconds(),
+		),
 			tag.WorkflowNamespaceID(e.replicationTask.RawTaskInfo.NamespaceId),
 			tag.WorkflowID(e.replicationTask.RawTaskInfo.WorkflowId),
 			tag.WorkflowRunID(e.replicationTask.RawTaskInfo.RunId),
@@ -317,7 +322,7 @@ func (e *ExecutableTaskImpl) emitFinishMetrics(
 	}
 
 	metrics.ReplicationLatency.With(e.MetricsHandler).Record(
-		now.Sub(e.taskCreationTime),
+		replicationLatency,
 		metrics.OperationTag(e.metricsTag),
 		nsTag,
 		metrics.SourceClusterTag(e.sourceClusterName),
@@ -340,7 +345,7 @@ func (e *ExecutableTaskImpl) Resend(
 ) (bool, error) {
 	remainingAttempt--
 	if remainingAttempt < 0 {
-		e.Logger.Error("resend history attempts exceeded",
+		softassert.Sometimes(e.Logger).Error("resend history attempts exceeded",
 			tag.WorkflowNamespaceID(retryErr.NamespaceId),
 			tag.WorkflowID(retryErr.WorkflowId),
 			tag.WorkflowRunID(retryErr.RunId),
@@ -413,14 +418,14 @@ func (e *ExecutableTaskImpl) Resend(
 		//  d. return error to resend new workflow before the branching point
 
 		if resendErr.Equal(retryErr) {
-			e.Logger.Error("error resend history on the same workflow run",
+			return false, softassert.UnexpectedDataLoss(e.Logger,
+				"failed to get requested data while resending history", nil,
 				tag.WorkflowNamespaceID(retryErr.NamespaceId),
 				tag.WorkflowID(retryErr.WorkflowId),
 				tag.WorkflowRunID(retryErr.RunId),
 				tag.NewStringTag("first-resend-error", retryErr.Error()),
 				tag.NewStringTag("second-resend-error", resendErr.Error()),
 			)
-			return false, serviceerror.NewDataLoss("failed to get requested data while resending history")
 		}
 		// handle 2nd resend error, then 1st resend error
 		_, err := e.Resend(ctx, remoteCluster, resendErr, remainingAttempt)
@@ -768,7 +773,7 @@ func (e *ExecutableTaskImpl) MarkPoisonPill() error {
 	taskInfo := e.ReplicationTask().GetRawTaskInfo()
 
 	if e.markPoisonPillAttempts >= MarkPoisonPillMaxAttempts {
-		e.Logger.Error("MarkPoisonPill reached max attempts",
+		softassert.Sometimes(e.Logger).Error("MarkPoisonPill reached max attempts",
 			tag.SourceCluster(e.SourceClusterName()),
 			tag.ReplicationTask(taskInfo),
 		)

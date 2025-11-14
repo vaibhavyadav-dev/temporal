@@ -28,6 +28,7 @@ const (
 	PartitionTagName            = "partition"
 	PriorityTagName             = "priority"
 	PersistenceDBKindTagName    = "db_kind"
+	WorkerPluginNameTagName     = "worker_plugin_name"
 )
 
 // This package should hold all the metrics and tags for temporal
@@ -355,6 +356,8 @@ const (
 	HistorySignalWithStartWorkflowExecutionScope = "SignalWithStartWorkflowExecution"
 	// HistoryCompleteNexusOperationScope tracks CompleteNexusOperation API calls received by service
 	HistoryCompleteNexusOperationScope = "CompleteNexusOperation"
+	// HistoryCompleteNexusOperationChasmScope tracks CompleteNexusOperationChasm API calls received by service
+	HistoryCompleteNexusOperationChasmScope = "CompleteNexusOperationChasm"
 	// HistorySyncShardStatusScope tracks HistorySyncShardStatus API calls received by service
 	HistorySyncShardStatusScope = "SyncShardStatus"
 	// HistoryShardControllerScope is the scope used by shard controller
@@ -853,6 +856,7 @@ var (
 	ActivityCancel                                       = NewCounterDef("activity_cancel")
 	ActivityTaskTimeout                                  = NewCounterDef("activity_task_timeout", WithDescription("Number of activity task timeouts (including retries)."))
 	ActivityTimeout                                      = NewCounterDef("activity_timeout", WithDescription("Number of terminal activity timeouts."))
+	ActivityPayloadSize                                  = NewCounterDef("activity_payload_size", WithDescription("Size of activity payloads in bytes."))
 	AckLevelUpdateCounter                                = NewCounterDef("ack_level_update")
 	AckLevelUpdateFailedCounter                          = NewCounterDef("ack_level_update_failed")
 	CommandCounter                                       = NewCounterDef("command")
@@ -959,7 +963,7 @@ var (
 	WorkflowTimeoutCount                  = NewCounterDef("workflow_timeout")
 	WorkflowTerminateCount                = NewCounterDef("workflow_terminate")
 	WorkflowContinuedAsNewCount           = NewCounterDef("workflow_continued_as_new")
-	WorkflowDuration                      = NewTimerDef("workflow_duration")
+	WorkflowScheduleToCloseLatency        = NewTimerDef("workflow_schedule_to_close_latency")
 	ReplicationStreamPanic                = NewCounterDef("replication_stream_panic")
 	ReplicationStreamError                = NewCounterDef("replication_stream_error")
 	ReplicationServiceError               = NewCounterDef("replication_service_error")
@@ -1109,6 +1113,28 @@ var (
 		"task_retry_transient",
 		WithDescription("Count of tasks that hit a transient error during match or forward and are retried immediately"),
 	)
+
+	// ----------------------------------------------------------------------------------------------------------------
+	// Matching service: Metrics to track the health of worker registry.
+	WorkerRegistryEvictionBlockedByAgeMetric = NewGaugeDef(
+		"worker_registry_eviction_blocked_by_age",
+		WithDescription(
+			"Set if entries could not be evicted due to minEvictAge policy in a given eviction iteration. "+
+				"Reset once a subsequent eviction succeeds.",
+		),
+	)
+	WorkerRegistryCapacityUtilizationMetric = NewGaugeDef(
+		"worker_registry_capacity_utilization",
+		WithDescription("Tracks the ratio of total entries to maxItems."),
+	)
+	// ----------------------------------------------------------------------------------------------------------------
+	// Matching service: Metrics to understand plugin adoption.
+	WorkerPluginNameMetric = NewGaugeDef(
+		"worker_plugin_name",
+		WithDescription(
+			"Set if the worker was configured with a plugin. Dimensions: namespace, plugin_name"),
+	)
+	// ----------------------------------------------------------------------------------------------------------------
 
 	// Versioning and Reachability
 	ReachabilityExitPointCounter = NewCounterDef("reachability_exit_point_count")

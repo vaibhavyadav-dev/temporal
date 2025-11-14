@@ -286,12 +286,19 @@ type (
 
 		AddTasks(tasks ...tasks.Task)
 		PopTasks() map[tasks.Category][]tasks.Task
+		DeleteCHASMPureTasks(maxScheduledTime time.Time)
+
 		SetUpdateCondition(int64, int64)
 		GetUpdateCondition() (int64, int64)
 
 		SetSpeculativeWorkflowTaskTimeoutTask(task *tasks.WorkflowTaskTimeoutTask) error
 		CheckSpeculativeWorkflowTaskTimeoutTask(task *tasks.WorkflowTaskTimeoutTask) bool
 		RemoveSpeculativeWorkflowTaskTimeoutTask()
+
+		SetWorkflowTaskScheduleToStartTimeoutTask(task *tasks.WorkflowTaskTimeoutTask)
+		SetWorkflowTaskStartToCloseTimeoutTask(task *tasks.WorkflowTaskTimeoutTask)
+		GetWorkflowTaskScheduleToStartTimeoutTask() *tasks.WorkflowTaskTimeoutTask
+		GetWorkflowTaskStartToCloseTimeoutTask() *tasks.WorkflowTaskTimeoutTask
 
 		IsDirty() bool
 		IsTransitionHistoryEnabled() bool
@@ -350,7 +357,9 @@ type (
 		// activities.
 		// If there is a pending workflow task that is not started yet, it'll be rescheduled after
 		// transition start.
-		StartDeploymentTransition(deployment *deploymentpb.Deployment) error
+		StartDeploymentTransition(deployment *deploymentpb.Deployment, revisionNumber int64) error
+		GetVersioningRevisionNumber() int64
+		SetVersioningRevisionNumber(revisionNumber int64)
 
 		AddReapplyCandidateEvent(event *historypb.HistoryEvent)
 		GetReapplyCandidateEvents() []*historypb.HistoryEvent

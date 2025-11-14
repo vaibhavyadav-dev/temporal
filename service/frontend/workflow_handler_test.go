@@ -43,6 +43,7 @@ import (
 	"go.temporal.io/server/common/cluster"
 	dc "go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/headers"
+	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/payload"
 	"go.temporal.io/server/common/payloads"
@@ -844,10 +845,12 @@ func (s *WorkflowHandlerSuite) TestStartWorkflowExecution_Failed_InvalidAggregat
 	s.mockSearchAttributesMapperProvider.EXPECT().GetMapper(gomock.Any()).AnyTimes().Return(nil, nil)
 	config := s.newConfig()
 	config.MaxLinksPerRequest = dc.GetIntPropertyFnFilteredByNamespace(10)
-	config.CallbackEndpointConfigs = dc.GetTypedPropertyFnFilteredByNamespace([]callbacks.AddressMatchRule{
-		{
-			Regexp:        regexp.MustCompile(`.*`),
-			AllowInsecure: true,
+	config.CallbackEndpointConfigs = dc.GetTypedPropertyFnFilteredByNamespace(callbacks.AddressMatchRules{
+		Rules: []callbacks.AddressMatchRule{
+			{
+				Regexp:        regexp.MustCompile(`.*`),
+				AllowInsecure: true,
+			},
 		},
 	})
 	wh := s.getWorkflowHandler(config)
@@ -2130,6 +2133,7 @@ func (s *WorkflowHandlerSuite) TestCountWorkflowExecutions() {
 }
 
 func (s *WorkflowHandlerSuite) TestVerifyHistoryIsComplete() {
+	logger := log.NewTestLogger()
 	events := make([]*historyspb.StrippedHistoryEvent, 50)
 	for i := 0; i < len(events); i++ {
 		events[i] = &historyspb.StrippedHistoryEvent{EventId: int64(i + 1)}
@@ -2174,6 +2178,7 @@ func (s *WorkflowHandlerSuite) TestVerifyHistoryIsComplete() {
 
 	for i, tc := range testCases {
 		err := api.VerifyHistoryIsComplete(
+			logger,
 			tc.events[0],
 			tc.events[len(tc.events)-1],
 			len(tc.events),
@@ -3888,5 +3893,66 @@ func (s *WorkflowHandlerSuite) TestPatchSchedule_ValidationAndErrors() {
 		resp, err := wh.PatchSchedule(ctx, request)
 		s.Nil(resp)
 		s.Error(err)
+	})
+}
+
+func (s *WorkflowHandlerSuite) TestUpdateTaskQueueConfig_Validation() {
+	config := s.newConfig()
+	wh := s.getWorkflowHandler(config)
+
+	s.Run("rate limit on workflow task queue should return error", func() {
+		s.mockNamespaceCache.EXPECT().GetNamespaceID(gomock.Eq(s.testNamespace)).Return(s.testNamespaceID, nil).Times(1)
+
+		request := &workflowservice.UpdateTaskQueueConfigRequest{
+			Namespace:     s.testNamespace.String(),
+			TaskQueue:     "test-task-queue",
+			TaskQueueType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+			UpdateQueueRateLimit: &workflowservice.UpdateTaskQueueConfigRequest_RateLimitUpdate{
+				RateLimit: &taskqueuepb.RateLimit{},
+			},
+		}
+
+		resp, err := wh.UpdateTaskQueueConfig(s.T().Context(), request)
+		s.Nil(resp)
+		s.EqualError(err, "Setting rate limit on workflow task queues is not allowed.")
+	})
+
+	s.Run("fairness key rate limit on workflow task queue should return error", func() {
+		s.mockNamespaceCache.EXPECT().GetNamespaceID(gomock.Eq(s.testNamespace)).Return(s.testNamespaceID, nil).Times(1)
+
+		request := &workflowservice.UpdateTaskQueueConfigRequest{
+			Namespace:     s.testNamespace.String(),
+			TaskQueue:     "test-task-queue",
+			TaskQueueType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+			UpdateFairnessKeyRateLimitDefault: &workflowservice.UpdateTaskQueueConfigRequest_RateLimitUpdate{
+				RateLimit: &taskqueuepb.RateLimit{},
+			},
+		}
+
+		resp, err := wh.UpdateTaskQueueConfig(s.T().Context(), request)
+		s.Nil(resp)
+		s.EqualError(err, "Setting fairness key rate limit on workflow task queues is not allowed.")
+	})
+
+	s.Run("fairness weight override on workflow task queue should return success", func() {
+		s.mockNamespaceCache.EXPECT().GetNamespaceID(gomock.Eq(s.testNamespace)).Return(s.testNamespaceID, nil).Times(1)
+		s.mockMatchingClient.EXPECT().UpdateTaskQueueConfig(gomock.Any(), gomock.Any()).Return(
+			&matchingservice.UpdateTaskQueueConfigResponse{
+				UpdatedTaskqueueConfig: &taskqueuepb.TaskQueueConfig{},
+			}, nil).Times(1)
+
+		request := &workflowservice.UpdateTaskQueueConfigRequest{
+			Namespace:     s.testNamespace.String(),
+			TaskQueue:     "test-task-queue",
+			TaskQueueType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+			SetFairnessWeightOverrides: map[string]float32{
+				"key1": 1.5,
+				"key2": 2.0,
+			},
+		}
+
+		resp, err := wh.UpdateTaskQueueConfig(s.T().Context(), request)
+		s.NoError(err)
+		s.NotNil(resp)
 	})
 }

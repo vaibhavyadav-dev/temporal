@@ -1,6 +1,7 @@
 package tasks
 
 import (
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +29,7 @@ type (
 		ScheduleAttempt     int32
 		TimeoutType         enumspb.TimeoutType
 		Version             int64
+		Stamp               int32
 
 		// InMemory field is not persisted in the database.
 		InMemory bool
@@ -85,4 +87,17 @@ func (d *WorkflowTaskTimeoutTask) Cancel() {
 }
 func (d *WorkflowTaskTimeoutTask) State() ctasks.State {
 	return ctasks.State(d.state.Load())
+}
+
+func (d *WorkflowTaskTimeoutTask) String() string {
+	return fmt.Sprintf("WorkflowTaskTimeoutTask{WorkflowKey: %s, VisibilityTimestamp: %v, TaskID: %v, EventID: %v, ScheduleAttempt: %v, TimeoutType: %v, Version: %v, InMemory: %v}",
+		d.WorkflowKey.String(),
+		d.VisibilityTimestamp,
+		d.TaskID,
+		d.EventID,
+		d.ScheduleAttempt,
+		d.TimeoutType,
+		d.Version,
+		d.InMemory,
+	)
 }
